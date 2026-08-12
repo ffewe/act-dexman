@@ -1,0 +1,6 @@
+Fri Dec 26 14:24:37 2025
+WARNING: mju_openResource: unknown file '/home/ubuntu/act-main_6/bimanual_viperx_ee_insertion.xml'
+
+Fri Dec 26 14:34:35 2025
+WARNING: mju_openResource: unknown file 'bimanual_viperx_ee_insertion.xml'
+
