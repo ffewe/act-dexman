@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="dual_arm_scene_tactile">
+  <!-- 引入带 160 个触觉 site 的双臂机器人本体 -->
+  <include file="dual_diana7_with_tactile.xml" />
+
+  <statistic center="0.3 0 1.0" extent="1.2" />
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.35 0.35 0.35" specular="0 0 0" />
+    <rgba haze="0.15 0.25 0.35 1" />
+    <global azimuth="150" elevation="-20" offwidth="1920" offheight="1080" />
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072" />
+    <material name="cube_mat" rgba="0.85 0.25 0.2 1" />
+  </asset>
+
+  <worldbody>
+    <light pos="0.4 0 3.0" dir="0 0 -1" directional="true" />
+    <!--
+    目标立方体：底面贴合台面(z=0.75)，双臂正前方中线 
+    <body name="cube" pos="0.45 0 0.8401">
+      <freejoint name="cube_free" />
+      <geom name="cube_geom" type="box" size="0.09 0.09 0.09"
+            material="cube_mat" mass="3.5"
+            contype="8" conaffinity="7"
+            friction="1.0 0.02 0.005" solimp="0.95 0.99 0.001" solref="0.005 1" />
+    </body>
+    -->
+
+    <body name="peg" pos="0.8 0.5 0.8401" euler="0 0 1.5708">
+            <joint name="red_peg_joint" type="free" frictionloss="0.01" />
+            <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
+            <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.09 0.02 0.02" type="box" name="red_peg" rgba="1 0 0 1" />
+    </body>
+
+   <body name="socket" pos="0.5 -0.5 0.8401" euler="0 0 1.5708">
+            <joint name="blue_socket_joint" type="free" frictionloss="0.01" />
+            <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
+            <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.05 0.001" pos="0 0 -0.025" size="0.05 0.024 0.003" type="box" name="socket-1" rgba="0 0 1 1" />
+            <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.05 0.001" pos="0 0 0.025" size="0.05 0.024 0.003" type="box" name="socket-2" rgba="0 0 1 1" />
+            <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.05 0.001" pos="0 0.025 0" size="0.05 0.003 0.024" type="box" name="socket-3" rgba="0 0 1 1" />
+            <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.05 0.001" pos="0 -0.025 0" size="0.05 0.003 0.024" type="box" name="socket-4" rgba="0 0 1 1" />
+          <!--  <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.04 0.01 0.01" type="box" name="pin" rgba="1 0 0 1" />-->
+    </body>
+
+
+
+  </worldbody>
+</mujoco>
