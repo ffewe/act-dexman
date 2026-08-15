@@ -30,13 +30,13 @@
     </body>
     -->
 
-    <body name="peg" pos="0.8 0.5 0.8401" euler="0 0 1.5708">
+    <body name="peg" pos="0.8 0.5 0.8401" euler="1.5708 0 1.5708">
             <joint name="red_peg_joint" type="free" frictionloss="0.01" />
             <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
             <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.005 0.0001" pos="0 0 0" size="0.09 0.02 0.02" type="box" name="red_peg" rgba="1 0 0 1" />
     </body>
 
-   <body name="socket" pos="0.5 -0.5 0.8401" euler="0 0 1.5708">
+   <body name="socket" pos="0.5 -0.5 0.8401" euler="1.5708 0 1.5708">
             <joint name="blue_socket_joint" type="free" frictionloss="0.01" />
             <inertial pos="0 0 0" mass="0.05" diaginertia="0.002 0.002 0.002" />
             <geom condim="4" solimp="2 1 0.01" solref="0.01 1" friction="1 0.05 0.001" pos="0 0 -0.025" size="0.05 0.024 0.003" type="box" name="socket-1" rgba="0 0 1 1" />
