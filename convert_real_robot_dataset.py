@@ -1,371 +1,1493 @@
-"""Convert real-robot teleoperation recordings into ACT HDF5 episodes.
+"""
+Raw real-robot dataset -> standardized HDF5 archive.
 
-Edit the configuration block below, then run this file without command-line
-arguments.  Each source recording can be either:
-  * one ZIP containing one CSV and one MP4; or
-  * a CSV and MP4 with the same file stem in SOURCE_DIR.
+This script is NOT an ACT training-data converter.
+
+Its purpose is to archive real-robot recordings faithfully so that
+different training datasets (ACT or other models) can be generated later.
+
+Input layout:
+
+SOURCE_DIR/
+    episode_0001/
+        data.csv
+        images/
+            000000.png
+            000001.png
+            ...
+
+    episode_0002/
+        data.csv
+        images/
+            000000.png
+            000001.png
+            ...
+
+Output layout:
+
+OUTPUT_DIR/
+    dataset_metadata.json
+
+    episode_0001/
+        data.hdf5
+        images/
+            000000.png
+            000001.png
+            ...
+        source_data.csv
+
+    episode_0002/
+        data.hdf5
+        images/
+            ...
+
+Important design principles:
+
+1. Do NOT define action.
+2. Do NOT remove the final frame.
+3. Do NOT resample the raw 30 Hz data.
+4. Do NOT resize images.
+5. Do NOT normalize values.
+6. Do NOT binarize the original gripper values.
+7. Preserve original timestamps.
+8. Preserve original CSV.
+9. Preserve raw image files.
+10. Store structured data in HDF5 for later processing.
 """
 
 import csv
 import json
 import shutil
-import tempfile
-import zipfile
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Tuple
 
-import cv2
 import h5py
 import numpy as np
+from PIL import Image
 
 
-# ============================== Configuration ==============================
-# Put raw CSV+MP4 pairs or ZIP recording packages in this folder.
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# Raw dataset directory.
 SOURCE_DIR = Path(r"D:\real_robot_raw_data")
-# Converted episode_new<N>.hdf5 files and JSON reports are written here.
-OUTPUT_DIR = Path(r"D:\act_real_robot_dataset")
 
-TARGET_HZ = 30.0
-OUTPUT_WIDTH = 640
-OUTPUT_HEIGHT = 480
+# Output archive directory.
+OUTPUT_DIR = Path(r"D:\real_robot_archive")
 
-# The CSV time zero maps to this time in the MP4:
-# video_time_s = elapsed_s + VIDEO_OFFSET_S.
-VIDEO_OFFSET_S = 0.0
+# Expected robot sampling frequency.
+EXPECTED_HZ = 30.0
 
-# CSV values are used as: mapped_joint = raw_joint * scale + offset.
-# Keep these defaults only when the CSV and robot controller use identical
-# joint order, joint direction, and zero positions.
-RIGHT_JOINT_SCALE = np.ones(7, dtype=np.float32)
-RIGHT_JOINT_OFFSET_RAD = np.zeros(7, dtype=np.float32)
-LEFT_JOINT_SCALE = np.ones(7, dtype=np.float32)
-LEFT_JOINT_OFFSET_RAD = np.zeros(7, dtype=np.float32)
+# Allowed timing deviation.
+# Example:
+# 30 Hz -> dt = 0.033333 s
+TIMESTAMP_TOLERANCE = 0.005
 
-# Hand convention stored in qpos and action: 0.0 = closed, 1.0 = open.
-OPEN_WORDS = {"1", "true", "yes", "open", "opened"}
-CLOSED_WORDS = {"0", "false", "no", "close", "closed"}
+# CSV filename inside each episode.
+CSV_NAME = "data.csv"
 
-# Do not silently overwrite an existing converted episode.
+# Image directory inside each episode.
+IMAGE_DIR_NAME = "images"
+
+# Accepted image extensions.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
+
+# Copy original CSV into output episode directory.
+COPY_SOURCE_CSV = True
+
+# Copy original images into output archive.
+# True = archive is self-contained.
+COPY_SOURCE_IMAGES = True
+
+# If False, existing episode output will raise an error.
 OVERWRITE_EXISTING = False
 
-FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+# qpos convention.
+#
+# IMPORTANT:
+# This is only a naming/layout convention for the archive.
+# It does NOT define ACT action.
+QPOS_LAYOUT = [
+    "right_arm_joint_1",
+    "right_arm_joint_2",
+    "right_arm_joint_3",
+    "right_arm_joint_4",
+    "right_arm_joint_5",
+    "right_arm_joint_6",
+    "right_arm_joint_7",
+    "right_gripper",
+    "left_arm_joint_1",
+    "left_arm_joint_2",
+    "left_arm_joint_3",
+    "left_arm_joint_4",
+    "left_arm_joint_5",
+    "left_arm_joint_6",
+    "left_arm_joint_7",
+    "left_gripper",
+]
+
+FINGERS = (
+    "thumb",
+    "index",
+    "middle",
+    "ring",
+    "pinky",
+)
+
+TCP_SUFFIXES = (
+    "x_m",
+    "y_m",
+    "z_m",
+    "rx_rad",
+    "ry_rad",
+    "rz_rad",
+)
+
+FORCE_COLUMNS = (
+    "force_fx_n",
+    "force_fy_n",
+    "force_fz_n",
+    "torque_mx_nm",
+    "torque_my_nm",
+    "torque_mz_nm",
+
+    "left_force_fx_n",
+    "left_force_fy_n",
+    "left_force_fz_n",
+    "left_torque_mx_nm",
+    "left_torque_my_nm",
+    "left_torque_mz_nm",
+)
 
 
-@dataclass
-class Recording:
-    name: str
-    csv_path: Path
-    video_path: Path
-    temporary_dir: Optional[Path] = None
+# ============================================================================
+# Utility functions
+# ============================================================================
 
+def read_csv(path: Path) -> Dict[str, List[str]]:
+    """
+    Read CSV while preserving the original string representation.
 
-def require_columns(rows, names, recording_name):
-    missing = [name for name in names if name not in rows]
-    if missing:
-        raise ValueError(f"{recording_name}: missing CSV columns: {missing}")
+    The original CSV is also copied to the output archive, so this parser
+    is only responsible for generating structured numeric datasets.
+    """
 
+    with path.open(
+        "r",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
 
-def numeric_column(rows, name):
-    try:
-        values = np.asarray([float(value) for value in rows[name]], dtype=np.float64)
-    except ValueError as exc:
-        raise ValueError(f"Column {name!r} contains a non-numeric value") from exc
-    if not np.isfinite(values).all():
-        raise ValueError(f"Column {name!r} contains NaN or infinity")
-    return values
-
-
-def hand_column(rows, name):
-    output = []
-    for raw in rows[name]:
-        value = raw.strip().lower()
-        if value in OPEN_WORDS:
-            output.append(1.0)
-        elif value in CLOSED_WORDS:
-            output.append(0.0)
-        else:
-            try:
-                output.append(float(value) >= 0.5)
-            except ValueError as exc:
-                raise ValueError(f"Unexpected hand value {raw!r} in {name}") from exc
-    return np.asarray(output, dtype=np.float64)
-
-
-def read_csv(path):
-    with path.open("r", newline="", encoding="utf-8-sig") as file:
         reader = csv.DictReader(file)
+
         if not reader.fieldnames:
-            raise ValueError(f"{path}: CSV has no header")
-        columns = {name: [] for name in reader.fieldnames}
+            raise ValueError(f"{path}: CSV has no header.")
+
+        columns = {
+            name: []
+            for name in reader.fieldnames
+        }
+
         for row in reader:
-            if any(value.strip() for value in row.values() if value is not None):
-                for name in columns:
-                    columns[name].append(row[name])
-    if not columns or not next(iter(columns.values())):
-        raise ValueError(f"{path}: CSV has no data rows")
+            # Ignore completely empty rows.
+            if not any(
+                value is not None and value.strip()
+                for value in row.values()
+            ):
+                continue
+
+            for name in columns:
+                value = row.get(name)
+
+                if value is None:
+                    value = ""
+
+                columns[name].append(value)
+
+    if not columns:
+        raise ValueError(f"{path}: empty CSV.")
+
+    num_rows = len(next(iter(columns.values())))
+
+    if num_rows == 0:
+        raise ValueError(f"{path}: CSV contains no data rows.")
+
     return columns
 
 
-def strictly_increasing_unique(time_s, *arrays):
-    """Sort rows by time and keep the final sample for duplicate timestamps."""
-    order = np.argsort(time_s, kind="stable")
-    time_s = time_s[order]
-    arrays = [array[order] for array in arrays]
-    keep = np.r_[time_s[1:] > time_s[:-1], True]
-    return (time_s[keep], *(array[keep] for array in arrays))
-
-
-def interpolate(time_s, values, target_s, categorical=False):
-    if categorical:
-        indices = np.searchsorted(time_s, target_s, side="left")
-        indices = np.clip(indices, 0, len(time_s) - 1)
-        previous = np.clip(indices - 1, 0, len(time_s) - 1)
-        use_previous = np.abs(target_s - time_s[previous]) <= np.abs(time_s[indices] - target_s)
-        return values[np.where(use_previous, previous, indices)]
-    flat = values.reshape(len(time_s), -1)
-    output = np.empty((len(target_s), flat.shape[1]), dtype=np.float64)
-    for index in range(flat.shape[1]):
-        output[:, index] = np.interp(target_s, time_s, flat[:, index])
-    return output.reshape((len(target_s), *values.shape[1:]))
-
-
-def csv_arrays(rows, recording_name):
-    right_joint_names = [f"right_arm_joint_{index}_rad" for index in range(1, 8)]
-    left_joint_names = [f"left_arm_joint_{index}_rad" for index in range(1, 8)]
-    force_names = [
-        "force_fx_n", "force_fy_n", "force_fz_n", "torque_mx_nm", "torque_my_nm", "torque_mz_nm",
-        "left_force_fx_n", "left_force_fy_n", "left_force_fz_n",
-        "left_torque_mx_nm", "left_torque_my_nm", "left_torque_mz_nm",
+def require_columns(
+    rows: Dict[str, List[str]],
+    columns: List[str],
+    episode_name: str,
+):
+    missing = [
+        column
+        for column in columns
+        if column not in rows
     ]
-    tcp_suffixes = ("x_m", "y_m", "z_m", "rx_rad", "ry_rad", "rz_rad")
-    required = ["elapsed_s", "right_hand_open", "left_hand_open", *right_joint_names, *left_joint_names, *force_names]
-    for side in ("left", "right"):
-        required.extend(f"{side}_arm_tcp_{suffix}" for suffix in tcp_suffixes)
-        required.extend(f"{side}_arm_cmd_{suffix}" for suffix in tcp_suffixes)
-        required.extend(f"{side}_tactile_{finger}" for finger in FINGERS)
-        required.extend(f"{side}_tactile_{finger}_taxel_{taxel:02d}_raw" for finger in FINGERS for taxel in range(1, 17))
-    require_columns(rows, required, recording_name)
 
-    time_s = numeric_column(rows, "elapsed_s")
-    right_arm = np.column_stack([numeric_column(rows, name) for name in right_joint_names])
-    left_arm = np.column_stack([numeric_column(rows, name) for name in left_joint_names])
-    right_arm = right_arm * RIGHT_JOINT_SCALE + RIGHT_JOINT_OFFSET_RAD
-    left_arm = left_arm * LEFT_JOINT_SCALE + LEFT_JOINT_OFFSET_RAD
-    qpos = np.column_stack([right_arm, hand_column(rows, "right_hand_open"), left_arm, hand_column(rows, "left_hand_open")])
-
-    force = np.column_stack([numeric_column(rows, name) for name in force_names])
-    tactile = []
-    tcp_measured = []
-    tcp_command = []
-    for side in ("left", "right"):
-        finger = np.column_stack([numeric_column(rows, f"{side}_tactile_{name}") for name in FINGERS])
-        taxels = np.stack([
-            np.column_stack([numeric_column(rows, f"{side}_tactile_{finger_name}_taxel_{taxel:02d}_raw") for taxel in range(1, 17)])
-            for finger_name in FINGERS
-        ], axis=1)
-        tactile.extend([taxels, finger])
-        tcp_measured.append(np.column_stack([numeric_column(rows, f"{side}_arm_tcp_{suffix}") for suffix in tcp_suffixes]))
-        tcp_command.append(np.column_stack([numeric_column(rows, f"{side}_arm_cmd_{suffix}") for suffix in tcp_suffixes]))
-
-    return strictly_increasing_unique(time_s, qpos, force, *tactile, *tcp_measured, *tcp_command)
+    if missing:
+        raise ValueError(
+            f"{episode_name}: missing CSV columns:\n"
+            + "\n".join(f"  - {name}" for name in missing)
+        )
 
 
-def video_metadata(path):
-    capture = cv2.VideoCapture(str(path))
-    if not capture.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    capture.release()
-    if fps <= 0 or count <= 0:
-        raise ValueError(f"Invalid video metadata: {path}")
-    return fps, count
+def numeric_column(
+    rows: Dict[str, List[str]],
+    name: str,
+) -> np.ndarray:
+
+    values = []
+
+    for index, value in enumerate(rows[name]):
+
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Column '{name}' contains a non-numeric value "
+                f"at row {index}: {value!r}"
+            ) from exc
+
+        values.append(number)
+
+    values = np.asarray(
+        values,
+        dtype=np.float64,
+    )
+
+    if not np.isfinite(values).all():
+        raise ValueError(
+            f"Column '{name}' contains NaN or infinity."
+        )
+
+    return values
 
 
-def decode_frames(path, frame_indices):
-    capture = cv2.VideoCapture(str(path))
-    frames = []
-    for frame_index in frame_indices:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ok, frame = capture.read()
-        if not ok:
-            capture.release()
-            raise ValueError(f"Could not decode frame {frame_index} from {path}")
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_AREA)
-        frames.append(frame)
-    capture.release()
-    return np.asarray(frames, dtype=np.uint8)
+def raw_column(
+    rows: Dict[str, List[str]],
+    name: str,
+) -> np.ndarray:
+
+    return np.asarray(
+        rows[name],
+        dtype=object,
+    )
 
 
-def discover_recordings(source_dir):
-    recordings = []
-    for archive in sorted(source_dir.rglob("*.zip")):
-        temp_dir = Path(tempfile.mkdtemp(prefix="act_conversion_"))
-        with zipfile.ZipFile(archive) as package:
-            csv_entries = [entry for entry in package.infolist() if entry.filename.lower().endswith(".csv")]
-            video_entries = [entry for entry in package.infolist() if Path(entry.filename).suffix.lower() in {".mp4", ".avi", ".mov"}]
-            if len(csv_entries) != 1 or len(video_entries) != 1:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                raise ValueError(f"{archive}: expected exactly one CSV and one video")
-            package.extract(csv_entries[0], temp_dir)
-            package.extract(video_entries[0], temp_dir)
-        recordings.append(Recording(archive.stem, temp_dir / csv_entries[0].filename, temp_dir / video_entries[0].filename, temp_dir))
+def validate_timestamps(
+    timestamps: np.ndarray,
+    episode_name: str,
+) -> Dict[str, float]:
 
-    csv_files = {path.relative_to(source_dir).with_suffix(""): path for path in source_dir.rglob("*.csv")}
-    video_files = {}
-    for suffix in ("*.mp4", "*.avi", "*.mov"):
-        for path in source_dir.rglob(suffix):
-            video_files[path.relative_to(source_dir).with_suffix("")] = path
-    for stem in sorted(csv_files.keys() & video_files.keys(), key=str):
-        recordings.append(Recording(stem.name, csv_files[stem], video_files[stem]))
-    return recordings
+    if len(timestamps) < 2:
+        raise ValueError(
+            f"{episode_name}: at least two timestamps are required."
+        )
 
+    if not np.isfinite(timestamps).all():
+        raise ValueError(
+            f"{episode_name}: timestamp contains NaN/Inf."
+        )
 
-def next_episode_index(output_dir):
-    existing = []
-    for path in output_dir.glob("episode_new*.hdf5"):
-        suffix = path.stem.removeprefix("episode_new")
-        if suffix.isdigit():
-            existing.append(int(suffix))
-    return max(existing, default=-1) + 1
+    dt = np.diff(timestamps)
 
+    if np.any(dt <= 0):
+        bad = np.where(dt <= 0)[0]
 
-def write_episode(path, arrays, images, source, report):
-    (time_s, qpos, qvel, force, left_taxels, left_finger, right_taxels, right_finger,
-     left_tcp, right_tcp, left_cmd, right_cmd, action) = arrays
-    with h5py.File(path, "w", rdcc_nbytes=2 * 1024 ** 2) as root:
-        root.attrs["sim"] = False
-        root.attrs["control_hz"] = TARGET_HZ
-        root.attrs["action_convention"] = "right_arm_7,right_hand,left_arm_7,left_hand"
-        root.attrs["hand_convention"] = "0=closed,1=open"
-        root.attrs["source_csv"] = str(source.csv_path)
-        root.attrs["source_video"] = str(source.video_path)
-        root.attrs["video_offset_s"] = VIDEO_OFFSET_S
-        root.attrs["conversion_version"] = "1"
+        raise ValueError(
+            f"{episode_name}: timestamps are not strictly increasing. "
+            f"Problem near indices: {bad[:10].tolist()}"
+        )
 
-        timestamps = root.create_group("timestamps")
-        timestamps.create_dataset("control_s", data=time_s.astype(np.float64))
-        observations = root.create_group("observations")
-        observations.create_dataset("qpos", data=qpos.astype(np.float32))
-        observations.create_dataset("qvel", data=qvel.astype(np.float32))
-        observations.create_dataset("force", data=force.astype(np.float32))
-        images_group = observations.create_group("images")
-        images_group.create_dataset("overview", data=images, compression="gzip", compression_opts=4, chunks=(1, OUTPUT_HEIGHT, OUTPUT_WIDTH, 3))
+    median_dt = float(np.median(dt))
+    mean_dt = float(np.mean(dt))
+    min_dt = float(np.min(dt))
+    max_dt = float(np.max(dt))
 
-        tactile = observations.create_group("tactile")
-        for side, taxels, finger in (("left", left_taxels, left_finger), ("right", right_taxels, right_finger)):
-            side_group = tactile.create_group(side)
-            side_group.create_dataset("taxels", data=taxels.astype(np.float32))
-            side_group.create_dataset("finger", data=finger.astype(np.float32))
-        combined = tactile.create_group("combined")
-        combined.create_dataset("taxels", data=np.concatenate([left_taxels, right_taxels], axis=1).astype(np.float32))
-        combined.create_dataset("finger", data=np.concatenate([left_finger, right_finger], axis=1).astype(np.float32))
+    measured_hz = 1.0 / median_dt
 
-        tcp_group = observations.create_group("tcp_measured")
-        tcp_group.create_dataset("left", data=left_tcp.astype(np.float32))
-        tcp_group.create_dataset("right", data=right_tcp.astype(np.float32))
-        commands = root.create_group("commands").create_group("tcp")
-        commands.create_dataset("left", data=left_cmd.astype(np.float32))
-        commands.create_dataset("right", data=right_cmd.astype(np.float32))
-        root.create_dataset("action", data=action.astype(np.float32))
-    path.with_suffix(".json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    expected_dt = 1.0 / EXPECTED_HZ
 
+    timing_error = abs(
+        median_dt - expected_dt
+    )
 
-def convert_recording(recording, output_path):
-    rows = read_csv(recording.csv_path)
-    (source_time, source_qpos, source_force, left_taxels, left_finger, right_taxels, right_finger,
-     left_tcp, right_tcp, left_cmd, right_cmd) = csv_arrays(rows, recording.name)
-    if len(source_time) < 3:
-        raise ValueError(f"{recording.name}: need at least three unique CSV samples")
+    if timing_error > TIMESTAMP_TOLERANCE:
 
-    video_fps, video_count = video_metadata(recording.video_path)
-    video_duration = (video_count - 1) / video_fps
-    source_grid = np.arange(source_time[0], source_time[-1] + 0.5 / TARGET_HZ, 1.0 / TARGET_HZ)
-    video_time = source_grid + VIDEO_OFFSET_S
-    valid = (video_time >= 0.0) & (video_time <= video_duration)
-    grid = source_grid[valid]
-    if len(grid) < 2:
-        raise ValueError(f"{recording.name}: CSV and video do not overlap for two control samples")
+        print(
+            f"[WARNING] {episode_name}: "
+            f"measured median frequency = "
+            f"{measured_hz:.3f} Hz, "
+            f"expected = {EXPECTED_HZ:.3f} Hz"
+        )
 
-    qpos = interpolate(source_time, source_qpos, grid)
-    force = interpolate(source_time, source_force, grid)
-    left_taxels = interpolate(source_time, left_taxels, grid)
-    left_finger = interpolate(source_time, left_finger, grid)
-    right_taxels = interpolate(source_time, right_taxels, grid)
-    right_finger = interpolate(source_time, right_finger, grid)
-    left_tcp = interpolate(source_time, left_tcp, grid)
-    right_tcp = interpolate(source_time, right_tcp, grid)
-    left_cmd = interpolate(source_time, left_cmd, grid)
-    right_cmd = interpolate(source_time, right_cmd, grid)
-    qpos[:, [7, 15]] = interpolate(source_time, source_qpos[:, [7, 15]], grid, categorical=True)
-
-    frame_indices = np.rint((grid + VIDEO_OFFSET_S) * video_fps).astype(int)
-    images = decode_frames(recording.video_path, frame_indices)
-
-    # The final state has no recorded next-state action label, so remove it.
-    action = qpos[1:]
-    qpos = qpos[:-1]
-    force = force[:-1]
-    left_taxels, left_finger = left_taxels[:-1], left_finger[:-1]
-    right_taxels, right_finger = right_taxels[:-1], right_finger[:-1]
-    left_tcp, right_tcp = left_tcp[:-1], right_tcp[:-1]
-    left_cmd, right_cmd = left_cmd[:-1], right_cmd[:-1]
-    images = images[:-1]
-    control_time = grid[:-1]
-    qvel = np.zeros_like(qpos)
-    arm_indices = [*range(7), *range(8, 15)]
-    qvel[:, arm_indices] = np.gradient(qpos[:, arm_indices], control_time, axis=0)
-
-    report = {
-        "recording": recording.name,
-        "source_rows": int(len(source_time)),
-        "output_steps": int(len(control_time)),
-        "source_duration_s": float(source_time[-1] - source_time[0]),
-        "output_hz": TARGET_HZ,
-        "video_fps": video_fps,
-        "video_duration_s": video_duration,
-        "video_offset_s": VIDEO_OFFSET_S,
-        "discarded_outside_video_steps": int((~valid).sum()),
-        "qpos_min_rad": qpos.min(axis=0).tolist(),
-        "qpos_max_rad": qpos.max(axis=0).tolist(),
-        "max_abs_joint_step_rad": float(np.abs(np.diff(qpos[:, [*range(7), *range(8, 15)]], axis=0)).max(initial=0.0)),
-        "max_abs_force": float(np.abs(force).max(initial=0.0)),
+    return {
+        "num_samples": len(timestamps),
+        "duration_s": float(
+            timestamps[-1] - timestamps[0]
+        ),
+        "mean_dt_s": mean_dt,
+        "median_dt_s": median_dt,
+        "min_dt_s": min_dt,
+        "max_dt_s": max_dt,
+        "measured_hz": measured_hz,
     }
-    arrays = (control_time, qpos, qvel, force, left_taxels, left_finger, right_taxels, right_finger,
-              left_tcp, right_tcp, left_cmd, right_cmd, action)
-    write_episode(output_path, arrays, images, recording, report)
 
+
+def find_images(image_dir: Path) -> List[Path]:
+
+    if not image_dir.exists():
+        raise FileNotFoundError(
+            f"Image directory does not exist: {image_dir}"
+        )
+
+    images = [
+        path
+        for path in image_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+
+    if not images:
+        raise ValueError(
+            f"No images found in {image_dir}"
+        )
+
+    # Prefer numeric filename ordering.
+    def sort_key(path: Path):
+
+        try:
+            return (
+                0,
+                int(path.stem),
+            )
+        except ValueError:
+            return (
+                1,
+                path.name,
+            )
+
+    images.sort(key=sort_key)
+
+    return images
+
+
+def validate_images(
+    image_paths: List[Path],
+    expected_count: int,
+    episode_name: str,
+) -> Tuple[int, int]:
+
+    if len(image_paths) != expected_count:
+
+        raise ValueError(
+            f"{episode_name}: image count does not match CSV rows.\n"
+            f"CSV rows   : {expected_count}\n"
+            f"Images     : {len(image_paths)}"
+        )
+
+    first_size = None
+
+    for index, path in enumerate(image_paths):
+
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+
+                if first_size is None:
+                    first_size = (
+                        width,
+                        height,
+                    )
+
+                if (
+                    width,
+                    height,
+                ) != first_size:
+
+                    raise ValueError(
+                        f"{episode_name}: image resolution mismatch.\n"
+                        f"Frame 0: {first_size}\n"
+                        f"Frame {index}: {(width, height)}\n"
+                        f"File: {path}"
+                    )
+
+        except Exception as exc:
+            raise ValueError(
+                f"{episode_name}: cannot read image "
+                f"{path}"
+            ) from exc
+
+    return first_size
+
+
+def read_hand_values(
+    rows: Dict[str, List[str]],
+    name: str,
+) -> np.ndarray:
+
+    """
+    Preserve the original semantic value while converting common
+    numeric representations to float.
+
+    IMPORTANT:
+    We do NOT threshold continuous values here.
+
+    Example:
+        0.12 -> 0.12
+        0.47 -> 0.47
+        0.91 -> 0.91
+
+    'open' / 'closed' are converted to 1 / 0.
+    """
+
+    output = []
+
+    open_words = {
+        "open",
+        "opened",
+        "true",
+        "yes",
+    }
+
+    closed_words = {
+        "close",
+        "closed",
+        "false",
+        "no",
+    }
+
+    for index, raw in enumerate(rows[name]):
+
+        value = raw.strip().lower()
+
+        if value in open_words:
+            output.append(1.0)
+
+        elif value in closed_words:
+            output.append(0.0)
+
+        else:
+
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{name}: invalid hand value at "
+                    f"row {index}: {raw!r}"
+                ) from exc
+
+            if not np.isfinite(number):
+                raise ValueError(
+                    f"{name}: NaN/Inf at row {index}"
+                )
+
+            output.append(number)
+
+    return np.asarray(
+        output,
+        dtype=np.float64,
+    )
+
+
+# ============================================================================
+# CSV -> structured arrays
+# ============================================================================
+
+def parse_robot_data(
+    rows: Dict[str, List[str]],
+    episode_name: str,
+):
+
+    right_joint_names = [
+        f"right_arm_joint_{i}_rad"
+        for i in range(1, 8)
+    ]
+
+    left_joint_names = [
+        f"left_arm_joint_{i}_rad"
+        for i in range(1, 8)
+    ]
+
+    required = [
+        "elapsed_s",
+
+        "right_hand_open",
+        "left_hand_open",
+
+        *right_joint_names,
+        *left_joint_names,
+
+        *FORCE_COLUMNS,
+    ]
+
+    for side in (
+        "left",
+        "right",
+    ):
+
+        required.extend(
+            f"{side}_arm_tcp_{suffix}"
+            for suffix in TCP_SUFFIXES
+        )
+
+        required.extend(
+            f"{side}_arm_cmd_{suffix}"
+            for suffix in TCP_SUFFIXES
+        )
+
+        required.extend(
+            f"{side}_tactile_{finger}"
+            for finger in FINGERS
+        )
+
+        required.extend(
+            f"{side}_tactile_{finger}"
+            f"_taxel_{taxel:02d}_raw"
+            for finger in FINGERS
+            for taxel in range(1, 17)
+        )
+
+    require_columns(
+        rows,
+        required,
+        episode_name,
+    )
+
+    # ----------------------------------------------------------------------
+    # Timestamp
+    # ----------------------------------------------------------------------
+
+    timestamp = numeric_column(
+        rows,
+        "elapsed_s",
+    )
+
+    # ----------------------------------------------------------------------
+    # qpos
+    # ----------------------------------------------------------------------
+
+    right_arm = np.column_stack([
+        numeric_column(rows, name)
+        for name in right_joint_names
+    ])
+
+    left_arm = np.column_stack([
+        numeric_column(rows, name)
+        for name in left_joint_names
+    ])
+
+    right_gripper = read_hand_values(
+        rows,
+        "right_hand_open",
+    )
+
+    left_gripper = read_hand_values(
+        rows,
+        "left_hand_open",
+    )
+
+    qpos = np.column_stack([
+        right_arm,
+        right_gripper,
+        left_arm,
+        left_gripper,
+    ])
+
+    # ----------------------------------------------------------------------
+    # qvel
+    #
+    # IMPORTANT:
+    # We do NOT calculate qvel here.
+    #
+    # If your CSV has real qvel columns, they can be added later.
+    # ----------------------------------------------------------------------
+
+    qvel = None
+
+    # ----------------------------------------------------------------------
+    # Force / torque
+    # ----------------------------------------------------------------------
+
+    force = np.column_stack([
+        numeric_column(rows, name)
+        for name in FORCE_COLUMNS
+    ])
+
+    # ----------------------------------------------------------------------
+    # TCP measured
+    # ----------------------------------------------------------------------
+
+    tcp_measured = {}
+
+    for side in (
+        "left",
+        "right",
+    ):
+
+        tcp_measured[side] = np.column_stack([
+            numeric_column(
+                rows,
+                f"{side}_arm_tcp_{suffix}",
+            )
+            for suffix in TCP_SUFFIXES
+        ])
+
+    # ----------------------------------------------------------------------
+    # TCP command
+    # ----------------------------------------------------------------------
+
+    tcp_command = {}
+
+    for side in (
+        "left",
+        "right",
+    ):
+
+        tcp_command[side] = np.column_stack([
+            numeric_column(
+                rows,
+                f"{side}_arm_cmd_{suffix}",
+            )
+            for suffix in TCP_SUFFIXES
+        ])
+
+    # ----------------------------------------------------------------------
+    # Gripper raw values
+    # ----------------------------------------------------------------------
+
+    gripper = np.column_stack([
+        right_gripper,
+        left_gripper,
+    ])
+
+    # ----------------------------------------------------------------------
+    # Tactile
+    # ----------------------------------------------------------------------
+
+    tactile = {}
+
+    for side in (
+        "left",
+        "right",
+    ):
+
+        # Per-finger summary values.
+        finger_values = np.column_stack([
+            numeric_column(
+                rows,
+                f"{side}_tactile_{finger}",
+            )
+            for finger in FINGERS
+        ])
+
+        # 16 taxels per finger.
+        #
+        # Shape:
+        #
+        #   [T, 5, 16]
+        #
+        # T = number of samples
+        #
+
+        taxels = np.stack([
+            np.column_stack([
+                numeric_column(
+                    rows,
+                    f"{side}_tactile_{finger}"
+                    f"_taxel_{taxel:02d}_raw",
+                )
+                for taxel in range(1, 17)
+            ])
+            for finger in FINGERS
+        ], axis=1)
+
+        tactile[side] = {
+            "finger": finger_values,
+            "taxels": taxels,
+        }
+
+    return {
+        "timestamp": timestamp,
+        "qpos": qpos,
+        "qvel": qvel,
+        "gripper": gripper,
+        "force": force,
+        "tcp_measured": tcp_measured,
+        "tcp_command": tcp_command,
+        "tactile": tactile,
+    }
+
+
+# ============================================================================
+# HDF5 writing
+# ============================================================================
+
+def write_string_dataset(
+    group,
+    name: str,
+    values,
+):
+
+    dtype = h5py.string_dtype(
+        encoding="utf-8"
+    )
+
+    group.create_dataset(
+        name,
+        data=np.asarray(
+            values,
+            dtype=object,
+        ),
+        dtype=dtype,
+    )
+
+
+def write_hdf5(
+    output_path: Path,
+    data,
+    image_paths: List[Path],
+    episode_name: str,
+    timing_report: Dict[str, float],
+    image_size: Tuple[int, int],
+):
+
+    timestamp = data["timestamp"]
+    qpos = data["qpos"]
+    gripper = data["gripper"]
+    force = data["force"]
+
+    with h5py.File(
+        output_path,
+        "w",
+    ) as root:
+
+        # ==================================================================
+        # Root metadata
+        # ==================================================================
+
+        root.attrs["dataset_type"] = (
+            "raw_robot_archive"
+        )
+
+        root.attrs["sim"] = False
+
+        root.attrs["expected_hz"] = EXPECTED_HZ
+
+        root.attrs["measured_hz"] = (
+            timing_report["measured_hz"]
+        )
+
+        root.attrs["episode_name"] = episode_name
+
+        root.attrs["num_samples"] = len(timestamp)
+
+        root.attrs["duration_s"] = (
+            timing_report["duration_s"]
+        )
+
+        root.attrs["image_width"] = image_size[0]
+
+        root.attrs["image_height"] = image_size[1]
+
+        root.attrs["image_count"] = len(
+            image_paths
+        )
+
+        root.attrs["image_format"] = (
+            image_paths[0].suffix.lower().lstrip(".")
+        )
+
+        root.attrs["conversion_version"] = "2.0"
+
+        root.attrs["contains_action"] = False
+
+        # ==================================================================
+        # timestamps
+        # ==================================================================
+
+        timestamps = root.create_group(
+            "timestamps"
+        )
+
+        timestamps.create_dataset(
+            "control_s",
+            data=timestamp.astype(
+                np.float64
+            ),
+        )
+
+        # ==================================================================
+        # observations
+        # ==================================================================
+
+        observations = root.create_group(
+            "observations"
+        )
+
+        observations.create_dataset(
+            "qpos",
+            data=qpos.astype(
+                np.float64
+            ),
+        )
+
+        observations.create_dataset(
+            "gripper",
+            data=gripper.astype(
+                np.float64
+            ),
+        )
+
+        observations.create_dataset(
+            "force",
+            data=force.astype(
+                np.float64
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # qpos metadata
+        # ------------------------------------------------------------------
+
+        observations["qpos"].attrs[
+            "layout"
+        ] = json.dumps(
+            QPOS_LAYOUT
+        )
+
+        observations["qpos"].attrs[
+            "units"
+        ] = "joint_rad_and_gripper_native_units"
+
+        observations["gripper"].attrs[
+            "layout"
+        ] = json.dumps([
+            "right_gripper",
+            "left_gripper",
+        ])
+
+        observations["gripper"].attrs[
+            "note"
+        ] = (
+            "Original gripper values; "
+            "not binarized."
+        )
+
+        # ------------------------------------------------------------------
+        # qvel
+        # ------------------------------------------------------------------
+
+        if data["qvel"] is not None:
+
+            observations.create_dataset(
+                "qvel",
+                data=data["qvel"].astype(
+                    np.float64
+                ),
+            )
+
+        # ------------------------------------------------------------------
+        # TCP measured
+        # ------------------------------------------------------------------
+
+        tcp_group = observations.create_group(
+            "tcp_measured"
+        )
+
+        for side in (
+            "left",
+            "right",
+        ):
+
+            dataset = tcp_group.create_dataset(
+                side,
+                data=data[
+                    "tcp_measured"
+                ][side].astype(
+                    np.float64
+                ),
+            )
+
+            dataset.attrs[
+                "layout"
+            ] = json.dumps([
+                "x",
+                "y",
+                "z",
+                "rx",
+                "ry",
+                "rz",
+            ])
+
+        # ------------------------------------------------------------------
+        # Tactile
+        # ------------------------------------------------------------------
+
+        tactile_group = observations.create_group(
+            "tactile"
+        )
+
+        for side in (
+            "left",
+            "right",
+        ):
+
+            side_group = tactile_group.create_group(
+                side
+            )
+
+            side_group.create_dataset(
+                "finger",
+                data=data[
+                    "tactile"
+                ][side]["finger"].astype(
+                    np.float64
+                ),
+            )
+
+            side_group.create_dataset(
+                "taxels",
+                data=data[
+                    "tactile"
+                ][side]["taxels"].astype(
+                    np.float64
+                ),
+            )
+
+        # ==================================================================
+        # commands
+        # ==================================================================
+
+        commands = root.create_group(
+            "commands"
+        )
+
+        tcp_commands = commands.create_group(
+            "tcp"
+        )
+
+        for side in (
+            "left",
+            "right",
+        ):
+
+            dataset = tcp_commands.create_dataset(
+                side,
+                data=data[
+                    "tcp_command"
+                ][side].astype(
+                    np.float64
+                ),
+            )
+
+            dataset.attrs[
+                "layout"
+            ] = json.dumps([
+                "x",
+                "y",
+                "z",
+                "rx",
+                "ry",
+                "rz",
+            ])
+
+        # ==================================================================
+        # images
+        #
+        # IMPORTANT:
+        # We do NOT put 3840x1080 RGB frames into HDF5 here.
+        #
+        # HDF5 stores the image file paths.
+        # The original PNG/JPG files remain in the episode directory.
+        # ==================================================================
+
+        images_group = root.create_group(
+            "images"
+        )
+
+        image_paths_relative = [
+            f"images/{path.name}"
+            for path in image_paths
+        ]
+
+        write_string_dataset(
+            images_group,
+            "overview",
+            image_paths_relative,
+        )
+
+        images_group["overview"].attrs[
+            "fps"
+        ] = EXPECTED_HZ
+
+        images_group["overview"].attrs[
+            "width"
+        ] = image_size[0]
+
+        images_group["overview"].attrs[
+            "height"
+        ] = image_size[1]
+
+        images_group["overview"].attrs[
+            "color"
+        ] = "RGB"
+
+        # ==================================================================
+        # raw information
+        #
+        # Store original gripper strings as well.
+        # ==================================================================
+
+        raw_group = root.create_group(
+            "raw"
+        )
+
+        raw_gripper = raw_group.create_group(
+            "gripper"
+        )
+
+        write_string_dataset(
+            raw_gripper,
+            "right_hand_open",
+            raw_column(
+                rows_global,
+                "right_hand_open",
+            ),
+        )
+
+        write_string_dataset(
+            raw_gripper,
+            "left_hand_open",
+            raw_column(
+                rows_global,
+                "left_hand_open",
+            ),
+        )
+
+        # ==================================================================
+        # No action!
+        # ==================================================================
+
+        root.attrs[
+            "action_definition"
+        ] = "NOT_DEFINED_IN_RAW_ARCHIVE"
+
+
+# ============================================================================
+# Dataset metadata
+# ============================================================================
+
+def write_dataset_metadata(
+    output_dir: Path,
+    episodes: List[Dict],
+):
+
+    metadata = {
+        "dataset_type": "raw_robot_archive",
+        "version": "2.0",
+
+        "description": (
+            "Standardized archive of real-robot "
+            "teleoperation recordings. "
+            "This dataset is model-agnostic and "
+            "does not define an action space."
+        ),
+
+        "expected_robot_hz": EXPECTED_HZ,
+
+        "image": {
+            "source": "individual_image_files",
+            "resize": False,
+            "normalization": False,
+        },
+
+        "qpos_layout": QPOS_LAYOUT,
+
+        "gripper": {
+            "stored_as_observation": True,
+            "preserve_raw_value": True,
+            "binarization": False,
+        },
+
+        "action": {
+            "defined": False,
+            "note": (
+                "Action will be defined later "
+                "when constructing a model-specific "
+                "training dataset."
+            ),
+        },
+
+        "episodes": episodes,
+    }
+
+    path = (
+        output_dir /
+        "dataset_metadata.json"
+    )
+
+    path.write_text(
+        json.dumps(
+            metadata,
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+# ============================================================================
+# Episode conversion
+# ============================================================================
+
+def convert_episode(
+    episode_dir: Path,
+    output_dir: Path,
+):
+
+    episode_name = episode_dir.name
+
+    csv_path = (
+        episode_dir /
+        CSV_NAME
+    )
+
+    image_dir = (
+        episode_dir /
+        IMAGE_DIR_NAME
+    )
+
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"{episode_name}: "
+            f"CSV not found: {csv_path}"
+        )
+
+    print()
+    print("=" * 70)
+    print(
+        f"Processing {episode_name}"
+    )
+    print("=" * 70)
+
+    # ----------------------------------------------------------------------
+    # Read CSV
+    # ----------------------------------------------------------------------
+
+    rows = read_csv(
+        csv_path
+    )
+
+    global rows_global
+    rows_global = rows
+
+    num_rows = len(
+        next(iter(rows.values()))
+    )
+
+    print(
+        f"CSV rows: {num_rows}"
+    )
+
+    # ----------------------------------------------------------------------
+    # Parse robot data
+    # ----------------------------------------------------------------------
+
+    data = parse_robot_data(
+        rows,
+        episode_name,
+    )
+
+    timestamp = data["timestamp"]
+
+    if len(timestamp) != num_rows:
+        raise ValueError(
+            f"{episode_name}: timestamp length mismatch."
+        )
+
+    # ----------------------------------------------------------------------
+    # Validate timestamps
+    # ----------------------------------------------------------------------
+
+    timing_report = validate_timestamps(
+        timestamp,
+        episode_name,
+    )
+
+    print(
+        f"Measured frequency: "
+        f"{timing_report['measured_hz']:.3f} Hz"
+    )
+
+    print(
+        f"Duration: "
+        f"{timing_report['duration_s']:.3f} s"
+    )
+
+    # ----------------------------------------------------------------------
+    # Find images
+    # ----------------------------------------------------------------------
+
+    image_paths = find_images(
+        image_dir
+    )
+
+    print(
+        f"Images: {len(image_paths)}"
+    )
+
+    image_size = validate_images(
+        image_paths,
+        num_rows,
+        episode_name,
+    )
+
+    print(
+        f"Image size: "
+        f"{image_size[0]} x "
+        f"{image_size[1]}"
+    )
+
+    # ----------------------------------------------------------------------
+    # Output directory
+    # ----------------------------------------------------------------------
+
+    episode_output = (
+        output_dir /
+        episode_name
+    )
+
+    if episode_output.exists():
+
+        if not OVERWRITE_EXISTING:
+
+            raise FileExistsError(
+                f"Output already exists: "
+                f"{episode_output}"
+            )
+
+        shutil.rmtree(
+            episode_output
+        )
+
+    episode_output.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ----------------------------------------------------------------------
+    # Copy original CSV
+    # ----------------------------------------------------------------------
+
+    if COPY_SOURCE_CSV:
+
+        shutil.copy2(
+            csv_path,
+            episode_output /
+            "source_data.csv",
+        )
+
+    # ----------------------------------------------------------------------
+    # Copy original images
+    # ----------------------------------------------------------------------
+
+    archive_image_dir = (
+        episode_output /
+        "images"
+    )
+
+    archive_image_dir.mkdir(
+        exist_ok=True
+    )
+
+    if COPY_SOURCE_IMAGES:
+
+        archived_image_paths = []
+
+        for index, source_image in enumerate(
+            image_paths
+        ):
+
+            suffix = (
+                source_image
+                .suffix
+                .lower()
+            )
+
+            target = (
+                archive_image_dir /
+                f"{index:06d}{suffix}"
+            )
+
+            shutil.copy2(
+                source_image,
+                target,
+            )
+
+            archived_image_paths.append(
+                target
+            )
+
+    else:
+
+        archived_image_paths = image_paths
+
+    # ----------------------------------------------------------------------
+    # Write HDF5
+    # ----------------------------------------------------------------------
+
+    hdf5_path = (
+        episode_output /
+        "data.hdf5"
+    )
+
+    write_hdf5(
+        hdf5_path,
+        data,
+        archived_image_paths,
+        episode_name,
+        timing_report,
+        image_size,
+    )
+
+    # ----------------------------------------------------------------------
+    # Episode metadata
+    # ----------------------------------------------------------------------
+
+    episode_metadata = {
+        "episode_name": episode_name,
+        "num_samples": num_rows,
+        "duration_s": timing_report[
+            "duration_s"
+        ],
+        "measured_hz": timing_report[
+            "measured_hz"
+        ],
+        "image_count": len(
+            archived_image_paths
+        ),
+        "image_width": image_size[0],
+        "image_height": image_size[1],
+        "hdf5": "data.hdf5",
+        "source_csv": "source_data.csv",
+        "action_defined": False,
+    }
+
+    (
+        episode_output /
+        "episode_metadata.json"
+    ).write_text(
+        json.dumps(
+            episode_metadata,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"[OK] {episode_name}"
+    )
+
+    return episode_metadata
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    if not SOURCE_DIR.is_dir():
-        raise FileNotFoundError(f"Set SOURCE_DIR to an existing folder: {SOURCE_DIR}")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    recordings = discover_recordings(SOURCE_DIR)
-    if not recordings:
-        raise FileNotFoundError("No CSV+MP4 pairs or ZIP recording packages found in SOURCE_DIR")
 
-    episode_index = next_episode_index(OUTPUT_DIR)
-    failures = []
-    for recording in recordings:
-        output_path = OUTPUT_DIR / f"episode_new{episode_index}.hdf5"
+    if not SOURCE_DIR.exists():
+
+        raise FileNotFoundError(
+            f"SOURCE_DIR does not exist:\n"
+            f"{SOURCE_DIR}"
+        )
+
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ----------------------------------------------------------------------
+    # Discover episodes
+    # ----------------------------------------------------------------------
+
+    episodes = [
+        path
+        for path in sorted(
+            SOURCE_DIR.iterdir()
+        )
+        if path.is_dir()
+    ]
+
+    if not episodes:
+
+        raise RuntimeError(
+            f"No episode directories found "
+            f"in {SOURCE_DIR}"
+        )
+
+    print(
+        f"Found {len(episodes)} episode(s)."
+    )
+
+    # ----------------------------------------------------------------------
+    # Convert
+    # ----------------------------------------------------------------------
+
+    episode_reports = []
+
+    for episode_dir in episodes:
+
         try:
-            if output_path.exists() and not OVERWRITE_EXISTING:
-                raise FileExistsError(f"Refusing to overwrite {output_path}")
-            convert_recording(recording, output_path)
-            print(f"Converted {recording.name} -> {output_path.name}")
-            episode_index += 1
-        except Exception as exc:
-            failures.append({"recording": recording.name, "error": str(exc)})
-            print(f"FAILED {recording.name}: {exc}")
-        finally:
-            if recording.temporary_dir:
-                shutil.rmtree(recording.temporary_dir, ignore_errors=True)
 
-    (OUTPUT_DIR / "conversion_summary.json").write_text(json.dumps({"failures": failures}, indent=2), encoding="utf-8")
-    if failures:
-        raise RuntimeError(f"Conversion finished with {len(failures)} failure(s); see conversion_summary.json")
+            report = convert_episode(
+                episode_dir,
+                OUTPUT_DIR,
+            )
+
+            episode_reports.append(
+                report
+            )
+
+        except Exception as exc:
+
+            print()
+            print(
+                f"[ERROR] "
+                f"{episode_dir.name}: "
+                f"{exc}"
+            )
+
+            # Continue with other episodes.
+            continue
+
+    # ----------------------------------------------------------------------
+    # Dataset metadata
+    # ----------------------------------------------------------------------
+
+    write_dataset_metadata(
+        OUTPUT_DIR,
+        episode_reports,
+    )
+
+    print()
+    print("=" * 70)
+    print("Conversion finished.")
+    print(
+        f"Successful episodes: "
+        f"{len(episode_reports)} / "
+        f"{len(episodes)}"
+    )
+    print(
+        f"Output: {OUTPUT_DIR}"
+    )
+    print("=" * 70)
 
 
 if __name__ == "__main__":
