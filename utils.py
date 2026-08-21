@@ -45,8 +45,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 action = root['/action'][start_ts:]
                 action_len = episode_len - start_ts
             else:
-                action = root['/action'][max(0, start_ts - 1):] # hack, to make timesteps more aligned
-                action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
+                action = root['/action'][start_ts:]
+
+                #action = root['/action'][max(0, start_ts - 1):] # hack, to make timesteps more aligned
+                #action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
 
         self.is_sim = is_sim
         padded_action = np.zeros(original_action_shape, dtype=np.float32)

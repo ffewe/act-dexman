@@ -55,11 +55,11 @@ class DETRVAE(nn.Module):
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(14, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(16, hidden_dim)
             self.input_proj_force = nn.Linear(12, hidden_dim)
         else:
             # input_dim = 14 + 7 # robot_state + env_state
-            self.input_proj_robot_state = nn.Linear(4, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(16, hidden_dim)
             self.input_proj_env_state = nn.Linear(7, hidden_dim)
             self.input_proj_force=nn.Linear(12,hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
@@ -239,7 +239,7 @@ def build_encoder(args):
 
 
 def build(args):
-    state_dim = 14 # TODO hardcode
+    state_dim = 16 # TODO hardcode
 
     # From state
     # backbone = None # from state for now, no need for conv nets
