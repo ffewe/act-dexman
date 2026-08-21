@@ -42,7 +42,6 @@ OUTPUT_DIR/
             ...
 
 Important design principles:
-
 1. Do NOT define action.
 2. Do NOT remove the final frame.
 3. Do NOT resample the raw 30 Hz data.
