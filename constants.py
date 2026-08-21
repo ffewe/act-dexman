@@ -32,6 +32,17 @@ SIM_TASK_CONFIGS = {
     },
 }
 
+REAL_TASK_CONFIGS = {
+    'real_dexman':{
+
+        'dataset_dir': DATA_DIR + '/sim_insertion_human',
+        'num_episodes': 200,
+        'episode_len': 900,
+        'camera_names': ['overview_left','overview_right'],
+        'control_hz':30
+    },
+}
+
 ### Simulation envs fixed constants
 DT = 0.02
 JOINT_NAMES = ["waist", "shoulder", "elbow", "forearm_roll", "wrist_angle", "wrist_rotate"]
