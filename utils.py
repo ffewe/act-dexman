@@ -28,39 +28,6 @@ class EpisodicDataset(torch.utils.data.Dataset):
         dataset_path = os.path.join(self.dataset_dir, f'episode_new{episode_id}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
             is_sim = root.attrs['sim']
-            """
-            original_action_shape = root['/action'].shape
-            episode_len = original_action_shape[0]
-            if sample_full_episode:
-                start_ts = 0
-            else:
-                start_ts = np.random.choice(episode_len)
-            # get observation at start_ts only
-            qpos = root['/observations/qpos'][start_ts]
-            qvel = root['/observations/qvel'][start_ts]
-            force = root['observations/force'][start_ts]
-            image_dict = dict()
-            for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
-            # get all actions after and including start_ts
-            #
-            if is_sim:
-                action = root['/action'][start_ts:]
-                action_len = episode_len - start_ts
-            else:
-                action = root['/action'][start_ts:]
-
-                #action = root['/action'][max(0, start_ts - 1):] # hack, to make timesteps more aligned
-                action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
-            #
-            action = root['/action'][start_ts:]
-            action_len = episode_len - start_ts
-            self.is_sim = is_sim
-        padded_action = np.zeros(original_action_shape, dtype=np.float32)
-        padded_action[:action_len] = action
-        is_pad = np.zeros(episode_len)
-        is_pad[action_len:] = 1
-        """
             original_action_shape = root['/action'].shape
             episode_len = original_action_shape[0]
             action_dim = original_action_shape[1]
@@ -271,7 +238,7 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats)
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats,chunk_size)
     val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats,chunk_size)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
